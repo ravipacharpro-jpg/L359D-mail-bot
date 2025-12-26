@@ -66,6 +66,78 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     login, domain, email = gen_email()
     users[uid] = {
+import os, re, random, string, requests, asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# ================= CONFIG =================
+
+TOKEN = os.getenv("BOT_TOKEN")
+
+# 🔐 ADMIN TELEGRAM ID (ALREADY SET)
+ADMIN_ID = 1969067694
+
+DOMAINS = ["1secmail.com", "1secmail.org", "1secmail.net"]
+
+CHECK_INTERVAL_FREE = 25
+CHECK_INTERVAL_PREMIUM = 10
+FREE_EMAIL_LIMIT = 3
+
+# ================= STORAGE =================
+
+users = {}          # uid -> user data
+seen_msgs = {}      # uid -> set(message ids)
+premium_users = set()
+banned_users = set()
+
+# ================= HELPERS =================
+
+def gen_email():
+    login = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    domain = random.choice(DOMAINS)
+    return login, domain, f"{login}@{domain}"
+
+def extract_otp(text):
+    m = re.search(r"\b\d{4,8}\b", text)
+    return m.group() if m else None
+
+def get_msgs(login, domain):
+    return requests.get(
+        f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}",
+        timeout=10
+    ).json()
+
+def read_msg(login, domain, mid):
+    return requests.get(
+        f"https://www.1secmail.com/api/v1/?action=readMessage&login={login}&domain={domain}&id={mid}",
+        timeout=10
+    ).json()
+
+def keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Inbox", callback_data="inbox")],
+        [InlineKeyboardButton("🔁 New Email", callback_data="new")],
+        [InlineKeyboardButton("🗑 Clear Inbox", callback_data="clear")]
+    ])
+
+# ================= USER HANDLERS =================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    if uid in banned_users:
+        return
+
+    data = users.get(uid, {"count": 0})
+
+    if uid not in premium_users and data["count"] >= FREE_EMAIL_LIMIT:
+        await update.message.reply_text(
+            "⚠️ Free limit reached.\nUpgrade to PREMIUM to continue 👑"
+        )
+        return
+
+    login, domain, email = gen_email()
+    users[uid] = {
         "login": login,
         "domain": domain,
         "email": email,
@@ -73,9 +145,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     seen_msgs[uid] = set()
 
+    badge = "👑 PREMIUM" if uid in premium_users else "🆓 FREE"
+
     await update.message.reply_text(
-        f"✨ *Welcome to L359D Mail*\n\n"
-        f"📧 *Your Temp Email*\n`{email}`\n\n"
+        f"✨ *L359D Mail*\n\n"
+        f"📧 `{email}`\n\n"
+        f"Status: {badge}\n"
         "🔔 Auto notify ON\n"
         "🔐 OTP auto-detect ON\n\n"
         "⚡ Powered by L359D",
@@ -88,107 +163,144 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
 
-    if uid not in users:
-        await q.edit_message_text("❌ Use /start first")
+    if uid not in users or uid in banned_users:
         return
 
     user = users[uid]
 
     if q.data == "new":
-        login, domain, email = gen_email()
-        users[uid].update({
-            "login": login,
-            "domain": domain,
-            "email": email
-        })
-        seen_msgs[uid] = set()
-
-        await q.edit_message_text(
-            f"🔁 *New Email*\n\n`{email}`",
-            parse_mode="Markdown",
-            reply_markup=keyboard()
-        )
+        await start(update, context)
 
     elif q.data == "clear":
         seen_msgs[uid] = set()
-        await q.edit_message_text(
-            "🗑 Inbox cleared\n(Provider side mails auto-expire)",
-            reply_markup=keyboard()
-        )
+        await q.edit_message_text("🗑 Inbox cleared", reply_markup=keyboard())
 
     elif q.data == "inbox":
-        msgs = get_messages(user["login"], user["domain"])
+        msgs = get_msgs(user["login"], user["domain"])
         if not msgs:
             await q.edit_message_text("📭 Inbox empty", reply_markup=keyboard())
             return
 
-        text = "📥 *Inbox*\n\n"
+        txt = "📥 *Inbox*\n\n"
         for m in msgs:
-            mail = read_message(user["login"], user["domain"], m["id"])
+            mail = read_msg(user["login"], user["domain"], m["id"])
             body = (mail.get("textBody") or "") + (mail.get("htmlBody") or "")
             otp = extract_otp(body)
 
-            text += f"📩 *From:* {m['from']}\n"
-            text += f"*Subject:* {m['subject']}\n"
+            txt += f"📩 *From:* {m['from']}\n"
+            txt += f"*Subject:* {m['subject']}\n"
             if otp:
-                text += f"🔐 *OTP:* `{otp}`\n"
-            text += "────────────\n"
+                txt += f"🔐 *OTP:* `{otp}`\n"
+            txt += "──────────\n"
 
-        await q.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=keyboard()
-        )
+        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=keyboard())
 
-# ================= AUTO NOTIFY LOOP =================
+# ================= AUTO NOTIFY =================
 
 async def auto_notify(app):
     while True:
         for uid, user in users.items():
+            if uid in banned_users:
+                continue
+
             try:
-                msgs = get_messages(user["login"], user["domain"])
+                msgs = get_msgs(user["login"], user["domain"])
                 for m in msgs:
                     if m["id"] in seen_msgs.get(uid, set()):
                         continue
 
-                    mail = read_message(user["login"], user["domain"], m["id"])
+                    mail = read_msg(user["login"], user["domain"], m["id"])
                     body = (mail.get("textBody") or "") + (mail.get("htmlBody") or "")
                     otp = extract_otp(body)
 
                     msg = (
-                        f"📨 *New Mail Received*\n\n"
+                        f"📨 *New Mail*\n\n"
                         f"*From:* {m['from']}\n"
                         f"*Subject:* {m['subject']}\n"
                     )
                     if otp:
                         msg += f"\n🔐 *OTP:* `{otp}`"
 
-                    await app.bot.send_message(
-                        chat_id=uid,
-                        text=msg,
-                        parse_mode="Markdown"
-                    )
-
+                    await app.bot.send_message(uid, msg, parse_mode="Markdown")
                     seen_msgs.setdefault(uid, set()).add(m["id"])
             except:
                 pass
 
-        await asyncio.sleep(CHECK_INTERVAL)
+        await asyncio.sleep(10)
+
+# ================= ADMIN COMMANDS =================
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        "👑 *ADMIN PANEL*\n\n"
+        "/stats\n"
+        "/premium <user_id>\n"
+        "/remove <user_id>\n"
+        "/ban <user_id>\n"
+        "/broadcast <message>",
+        parse_mode="Markdown"
+    )
+
+async def stats(update: Update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        f"👥 Users: {len(users)}\n"
+        f"👑 Premium: {len(premium_users)}\n"
+        f"🚫 Banned: {len(banned_users)}"
+    )
+
+async def premium(update: Update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    uid = int(context.args[0])
+    premium_users.add(uid)
+    await update.message.reply_text(f"✅ {uid} is now PREMIUM")
+
+async def remove(update: Update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    uid = int(context.args[0])
+    premium_users.discard(uid)
+    await update.message.reply_text(f"❌ {uid} premium removed")
+
+async def ban(update: Update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    uid = int(context.args[0])
+    banned_users.add(uid)
+    await update.message.reply_text(f"🚫 {uid} banned")
+
+async def broadcast(update: Update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    msg = " ".join(context.args)
+    for uid in users:
+        try:
+            await context.bot.send_message(uid, msg)
+        except:
+            pass
 
 # ================= MAIN =================
 
 def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN not set")
-
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(buttons))
 
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("premium", premium))
+    app.add_handler(CommandHandler("remove", remove))
+    app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+
     app.job_queue.run_once(lambda _: asyncio.create_task(auto_notify(app)), 1)
 
-    print("🔥 L359D Mail Bot FULL PRO Running...")
+    print("🔥 L359D Mail — FULL PREMIUM + ADMIN LIVE")
     app.run_polling()
 
 if __name__ == "__main__":
