@@ -1,109 +1,215 @@
-import os
-import re
-import random
-import string
-import asyncio
-import requests
+import os, random, string, re, asyncio, requests
+from datetime import datetime
+from pymongo import MongoClient
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes
 )
 
 # ================= CONFIG =================
+TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+ADMIN_ID = 1969067694  # <-- tumhari admin ID
 
-TOKEN = os.getenv("BOT_TOKEN")  # Railway env variable
-ADMIN_ID = 1969067694           # tumhara Telegram ID
-
-DOMAINS = ["1secmail.com", "1secmail.net", "1secmail.org"]
-
-FREE_EMAIL_LIMIT = 3
+DOMAINS = ["1secmail.com", "1secmail.org", "1secmail.net"]
 CHECK_INTERVAL_FREE = 25
 CHECK_INTERVAL_PREMIUM = 10
+FREE_LIMIT = 3
 
-# ================= STORAGE (RAM) =================
-
-users = {}            # uid -> {login, domain, count}
-seen_msgs = {}        # uid -> set(msg_ids)
-premium_users = set()
-banned_users = set()
+# ================= DB =================
+client = MongoClient(MONGO_URI)
+db = client["tempmail"]
+users_col = db["users"]     # user data
+mails_col = db["mails"]     # all generated mails
 
 # ================= HELPERS =================
+def gen_login(k=10):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
 def gen_email():
-    login = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    login = gen_login()
     domain = random.choice(DOMAINS)
     return login, domain, f"{login}@{domain}"
 
-def extract_otp(text):
+def otp_from_text(text):
     m = re.search(r"\b\d{4,8}\b", text)
-    return m.group() if m else None
+    return m.group(0) if m else None
 
-def get_messages(login, domain):
-    url = "https://www.1secmail.com/api/v1/"
+def keyboard(active_id=None):
+    btns = [
+        [InlineKeyboardButton("📬 Inbox", callback_data="inbox")],
+        [InlineKeyboardButton("🔄 New Email", callback_data="new")],
+        [InlineKeyboardButton("🧾 My IDs", callback_data="ids")],
+    ]
+    if active_id:
+        btns.append([InlineKeyboardButton("🗑️ Delete Active", callback_data=f"del_{active_id}")])
+    return InlineKeyboardMarkup(btns)
+
+# ================= API =================
+def api_msgs(login, domain):
     return requests.get(
-        url,
-        params={
-            "action": "getMessages",
-            "login": login,
-            "domain": domain
-        },
+        f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}",
         timeout=10
     ).json()
 
-def read_message(login, domain, msg_id):
-    url = "https://www.1secmail.com/api/v1/"
+def api_read(login, domain, mid):
     return requests.get(
-        url,
-        params={
-            "action": "readMessage",
-            "login": login,
-            "domain": domain,
-            "id": msg_id
-        },
+        f"https://www.1secmail.com/api/v1/?action=readMessage&login={login}&domain={domain}&id={mid}",
         timeout=10
     ).json()
 
-def keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Inbox", callback_data="inbox")],
-        [InlineKeyboardButton("🔁 New Email", callback_data="new")],
-        [InlineKeyboardButton("🗑 Clear Inbox", callback_data="clear")],
-    ])
-
-# ================= USER COMMANDS =================
-
+# ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-
-    if uid in banned_users:
-        return
-
-    data = users.get(uid, {"count": 0})
-
-    if uid not in premium_users and data["count"] >= FREE_EMAIL_LIMIT:
-        await update.message.reply_text(
-            "⚠️ Free limit reached.\nUpgrade to PREMIUM 👑"
-        )
-        return
-
-    login, domain, email = gen_email()
-    users[uid] = {
-        "login": login,
-        "domain": domain,
-        "count": data["count"] + 1
+    user = users_col.find_one({"uid": uid}) or {
+        "uid": uid, "premium": False, "active_mail": None, "count": 0, "banned": False
     }
-    seen_msgs[uid] = set()
+    if user.get("banned"):
+        return
 
+    if not user.get("active_mail"):
+        if not user.get("premium") and user.get("count", 0) >= FREE_LIMIT:
+            await update.message.reply_text("⚠️ Free limit reached. Upgrade to Premium.")
+            return
+        login, domain, email = gen_email()
+        mail_id = random.randint(10000000, 99999999)
+        mails_col.insert_one({
+            "uid": uid, "mail_id": mail_id,
+            "login": login, "domain": domain,
+            "email": email, "created": datetime.utcnow()
+        })
+        user["active_mail"] = mail_id
+        user["count"] = user.get("count", 0) + 1
+        users_col.update_one({"uid": uid}, {"$set": user}, upsert=True)
+
+    mail = mails_col.find_one({"mail_id": user["active_mail"]})
     await update.message.reply_text(
-        f"📧 *Your Temporary Email*\n\n`{email}`\n\n"
-        "Use this email for verification.\n"
+        f"📧 *Your Temporary Email*\n`{mail['email']}`\n\nInbox yahin milega 👇",
+        parse_mode="Markdown",
+        reply_markup=keyboard(user["active_mail"])
+    )
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        "👑 *ADMIN PANEL*\n\n"
+        "/stats – Bot stats\n"
+        "/allmails – All generated mails\n"
+        "/premium <uid>\n"
+        "/remove <uid>\n"
+        "/ban <uid>\n"
+        "/broadcast <msg>",
+        parse_mode="Markdown"
+    )
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        f"👥 Users: {users_col.count_documents({})}\n"
+        f"📧 Mails: {mails_col.count_documents({})}"
+    )
+
+async def allmails(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    text = "📧 *ALL MAILS*\n"
+    for m in mails_col.find().limit(30):
+        text += f"- `{m['email']}` (uid {m['uid']})\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# ================= CALLBACKS =================
+async def on_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = users_col.find_one({"uid": uid})
+    if not user: return
+
+    if q.data == "new":
+        if not user.get("premium") and user.get("count", 0) >= FREE_LIMIT:
+            await q.edit_message_text("⚠️ Free limit reached.")
+            return
+        login, domain, email = gen_email()
+        mail_id = random.randint(10000000, 99999999)
+        mails_col.insert_one({
+            "uid": uid, "mail_id": mail_id,
+            "login": login, "domain": domain,
+            "email": email, "created": datetime.utcnow()
+        })
+        users_col.update_one(
+            {"uid": uid},
+            {"$set": {"active_mail": mail_id}, "$inc": {"count": 1}}
+        )
+        await q.edit_message_text(
+            f"📧 *New Email*\n`{email}`",
+            parse_mode="Markdown",
+            reply_markup=keyboard(mail_id)
+        )
+
+    elif q.data == "ids":
+        mails = list(mails_col.find({"uid": uid}))
+        if not mails:
+            await q.edit_message_text("No emails yet.")
+            return
+        text = "*Your Mail IDs*\n"
+        kb = []
+        for i, m in enumerate(mails, 1):
+            text += f"{i}. `{m['email']}`\n"
+            kb.append([
+                InlineKeyboardButton("Use", callback_data=f"use_{m['mail_id']}"),
+                InlineKeyboardButton("Delete", callback_data=f"del_{m['mail_id']}")
+            ])
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif q.data.startswith("use_"):
+        mid = int(q.data.split("_")[1])
+        users_col.update_one({"uid": uid}, {"$set": {"active_mail": mid}})
+        mail = mails_col.find_one({"mail_id": mid})
+        await q.edit_message_text(
+            f"✅ Active set to `{mail['email']}`",
+            parse_mode="Markdown",
+            reply_markup=keyboard(mid)
+        )
+
+    elif q.data.startswith("del_"):
+        mid = int(q.data.split("_")[1])
+        mails_col.delete_one({"uid": uid, "mail_id": mid})
+        if user.get("active_mail") == mid:
+            users_col.update_one({"uid": uid}, {"$set": {"active_mail": None}})
+        await q.edit_message_text("🗑️ Deleted.")
+
+    elif q.data == "inbox":
+        mail = mails_col.find_one({"mail_id": user.get("active_mail")})
+        if not mail:
+            await q.edit_message_text("No active email.")
+            return
+        msgs = api_msgs(mail["login"], mail["domain"])
+        if not msgs:
+            await q.edit_message_text("📭 Inbox empty.")
+            return
+        text = "📬 *Inbox*\n"
+        for m in msgs:
+            full = api_read(mail["login"], mail["domain"], m["id"])
+            otp = otp_from_text(full.get("textBody", "") + full.get("htmlBody", ""))
+            text += f"- From: {m['from']}\n"
+            if otp: text += f"🔑 OTP: `{otp}`\n"
+            text += "\n"
+        await q.edit_message_text(text, parse_mode="Markdown")
+
+# ================= MAIN =================
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("admin", admin))
+app.add_handler(CommandHandler("stats", stats))
+app.add_handler(CommandHandler("allmails", allmails))
+app.add_handler(CallbackQueryHandler(on_btn))
+
+app.run_polling()
         "Inbox yahin milega 👇",
         reply_markup=keyboard(),
         parse_mode="Markdown"
