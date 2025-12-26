@@ -1,71 +1,3 @@
-import os
-import re
-import time
-import random
-import string
-import requests
-import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes
-)
-
-# ================= CONFIG =================
-
-TOKEN = os.getenv("BOT_TOKEN")
-
-DOMAINS = ["1secmail.com", "1secmail.org", "1secmail.net"]
-CHECK_INTERVAL = 15            # seconds (auto notify)
-MAX_EMAILS_PER_USER = 5        # security limit
-
-# ================= STORAGE =================
-
-users = {}      # user_id -> data
-seen_msgs = {}  # user_id -> set(msg_ids)
-
-# ================= HELPERS =================
-
-def gen_email():
-    login = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    domain = random.choice(DOMAINS)
-    return login, domain, f"{login}@{domain}"
-
-def get_messages(login, domain):
-    url = f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}"
-    return requests.get(url, timeout=10).json()
-
-def read_message(login, domain, mid):
-    url = f"https://www.1secmail.com/api/v1/?action=readMessage&login={login}&domain={domain}&id={mid}"
-    return requests.get(url, timeout=10).json()
-
-def extract_otp(text):
-    m = re.search(r"\b\d{4,8}\b", text)
-    return m.group() if m else None
-
-def keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Inbox", callback_data="inbox")],
-        [InlineKeyboardButton("🔁 New Email", callback_data="new")],
-        [InlineKeyboardButton("🗑 Clear Inbox", callback_data="clear")],
-    ])
-
-# ================= HANDLERS =================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-
-    data = users.get(uid, {"count": 0})
-    if data["count"] >= MAX_EMAILS_PER_USER:
-        await update.message.reply_text(
-            "⚠️ Limit reached.\nPlease wait or use existing email."
-        )
-        return
-
-    login, domain, email = gen_email()
-    users[uid] = {
 import os, re, random, string, requests, asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -74,7 +6,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-# 🔐 ADMIN TELEGRAM ID (ALREADY SET)
+# 🔐 ADMIN TELEGRAM ID (CONFIRMED)
 ADMIN_ID = 1969067694
 
 DOMAINS = ["1secmail.com", "1secmail.org", "1secmail.net"]
@@ -283,14 +215,15 @@ async def broadcast(update: Update, context):
         except:
             pass
 
-# ================= MAIN =================
+# ================= MAIN (ADMIN FIXED) =================
 
 def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN not set")
+
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(buttons))
-
+    # 🔴 ADMIN COMMANDS FIRST (IMPORTANT)
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("premium", premium))
@@ -298,6 +231,11 @@ def main():
     app.add_handler(CommandHandler("ban", ban))
     app.add_handler(CommandHandler("broadcast", broadcast))
 
+    # 🔵 USER COMMANDS
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(buttons))
+
+    # 🔔 AUTO NOTIFY LOOP
     app.job_queue.run_once(lambda _: asyncio.create_task(auto_notify(app)), 1)
 
     print("🔥 L359D Mail — FULL PREMIUM + ADMIN LIVE")
